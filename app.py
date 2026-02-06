@@ -56,7 +56,7 @@ st.markdown("""
     }
     
     .metric-label {
-        font-size: 1.5rem;
+        font-size: 1rem;
         color: #94A3B8;
         font-weight: 600;
         text-transform: uppercase;
@@ -64,7 +64,7 @@ st.markdown("""
     }
     
     .metric-value {
-        font-size: 1.5rem;
+        font-size: 1rem;
         font-weight: 500;
         color: #F8FAFC;
         margin-top: 4px;

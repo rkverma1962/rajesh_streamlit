@@ -213,13 +213,17 @@ class Config:
     MAX_TRADES_PER_DAY = 5
     MAX_LOSS_PER_DAY = 3000
     TRADE_START = dtime(9, 20)
-    ENTRY_END = dtime(14, 45)
-    SQUARE_OFF_TIME = dtime(15, 10)
+    ENTRY_END = dtime(14, 45)  # Last entry time for NSE indices
+    SQUARE_OFF_TIME = dtime(15, 10)  # Square off before market close
     
     # MCX specific timings for CRUDEOIL
     MCX_TRADE_START = dtime(9, 30)
-    MCX_ENTRY_END = dtime(22, 0)
-    MCX_SQUARE_OFF_TIME = dtime(23, 00)
+    MCX_ENTRY_END = dtime(22, 0)  # Last entry time for MCX
+    MCX_SQUARE_OFF_TIME = dtime(23, 00)  # Square off before MCX close
+    
+    # Cooldown settings (in seconds)
+    COOLDOWN_AFTER_ORDER = 30  # 30 seconds cooldown after placing an order
+    COOLDOWN_AFTER_SIGNAL = 10  # 10 seconds cooldown after receiving a signal
     
     TOKEN_FILE = "access_token.txt"
     CREDENTIALS_FILE = "credentials.enc"
@@ -283,7 +287,10 @@ def init_session_state():
         'credentials_saved': False,
         'login_step': 'initial',
         'api_key': '',
-        'api_secret': ''
+        'api_secret': '',
+        'last_order_time': None,  # Track last order placement time
+        'last_signal_time': None,  # Track last signal generation time
+        'square_off_triggered': False  # Track if square off has been triggered
     }
     
     for key, value in defaults.items():
@@ -321,7 +328,9 @@ def save_config():
             'TSL_TRIGGER': Config.TSL_TRIGGER,
             'TSL_STEP': Config.TSL_STEP,
             'MAX_TRADES_PER_DAY': Config.MAX_TRADES_PER_DAY,
-            'MAX_LOSS_PER_DAY': Config.MAX_LOSS_PER_DAY
+            'MAX_LOSS_PER_DAY': Config.MAX_LOSS_PER_DAY,
+            'COOLDOWN_AFTER_ORDER': Config.COOLDOWN_AFTER_ORDER,
+            'COOLDOWN_AFTER_SIGNAL': Config.COOLDOWN_AFTER_SIGNAL
         }
         
         with open(Config.CONFIG_FILE, 'w') as f:
@@ -449,6 +458,44 @@ def round_to_tick(price, index_name):
     else:
         multiplier = 1 / tick_size
         return round(price * multiplier) / multiplier
+
+def is_cooldown_active():
+    """Check if cooldown period is active"""
+    now = datetime.now()
+    
+    # Check order cooldown
+    if st.session_state.last_order_time:
+        order_cooldown_end = st.session_state.last_order_time + timedelta(seconds=Config.COOLDOWN_AFTER_ORDER)
+        if now < order_cooldown_end:
+            time_left = (order_cooldown_end - now).seconds
+            return True, f"Order cooldown active: {time_left}s remaining"
+    
+    # Check signal cooldown
+    if st.session_state.last_signal_time:
+        signal_cooldown_end = st.session_state.last_signal_time + timedelta(seconds=Config.COOLDOWN_AFTER_SIGNAL)
+        if now < signal_cooldown_end:
+            time_left = (signal_cooldown_end - now).seconds
+            return True, f"Signal cooldown active: {time_left}s remaining"
+    
+    return False, ""
+
+def should_square_off_before_close(index_name):
+    """Check if we should square off positions before market close"""
+    now = datetime.now()
+    now_time = now.time()
+    
+    if index_name == "CRUDEOIL":
+        # Square off 5 minutes before MCX close
+        square_off_time = Config.MCX_SQUARE_OFF_TIME
+        # Check if it's 5 minutes before square off time
+        five_min_before = (datetime.combine(now.date(), square_off_time) - timedelta(minutes=5)).time()
+        return now_time >= five_min_before and now_time <= square_off_time
+    else:
+        # Square off 5 minutes before NSE close
+        square_off_time = Config.SQUARE_OFF_TIME
+        # Check if it's 5 minutes before square off time
+        five_min_before = (datetime.combine(now.date(), square_off_time) - timedelta(minutes=5)).time()
+        return now_time >= five_min_before and now_time <= square_off_time
 
 # --- INSTRUMENTS ---
 def load_instruments(kite, exchange="ALL"):
@@ -738,18 +785,27 @@ class TradeManager:
             return False, "Bot stopped"
         
         index_name = st.session_state.selected_index
-        trade_start, entry_end, _ = get_trading_hours(index_name)
+        trade_start, entry_end, square_off_time = get_trading_hours(index_name)
         
         now_time = datetime.now().time()
-        if not (trade_start <= now_time <= entry_end):
-            return False, "Outside trading hours"
         
+        # Check if we're within trading hours for new entries
+        if not (trade_start <= now_time <= entry_end):
+            return False, f"Outside entry hours ({trade_start.strftime('%H:%M')}-{entry_end.strftime('%H:%M')})"
+        
+        # Check cooldown periods
+        cooldown_active, cooldown_msg = is_cooldown_active()
+        if cooldown_active:
+            return False, cooldown_msg
+        
+        # Check daily limits
         if st.session_state.today_trades_count >= Config.MAX_TRADES_PER_DAY:
             return False, "Max trades reached"
         
         if st.session_state.today_loss >= Config.MAX_LOSS_PER_DAY:
             return False, "Max loss reached"
         
+        # Check if there's already an active trade
         if len(st.session_state.active_trades) > 0:
             return False, "Active trade exists"
         
@@ -844,6 +900,9 @@ class TradeManager:
                 
                 self.add_order_record(order_record)
                 
+                # Set last order time for cooldown
+                st.session_state.last_order_time = datetime.now()
+                
                 time.sleep(2)
                 self.check_order_status(order_id)
                 
@@ -929,6 +988,17 @@ class TradeManager:
     
     def monitor_trades(self):
         completed = []
+        
+        # First check if we need to square off before market close
+        if len(st.session_state.active_trades) > 0:
+            index_name = st.session_state.selected_index
+            if should_square_off_before_close(index_name) and not st.session_state.square_off_triggered:
+                st.warning(f"⚠️ Market closing soon! Squaring off all positions for {index_name}...")
+                self.square_off_all()
+                st.session_state.square_off_triggered = True
+                return completed
+        
+        # Monitor trades for SL/TP/TSL
         for trade in st.session_state.active_trades[:]:
             try:
                 exchange = trade.get('exchange', 'NFO')
@@ -1071,8 +1141,13 @@ class TradeManager:
                 current = ltp_data[f"{exchange}:{trade['symbol']}"]["last_price"]
                 current = round_to_tick(current, trade['index'])
                 self.exit_trade(trade, current, "Square Off")
+                trade['exit_price'] = current
+                trade['exit_time'] = datetime.now().isoformat()
+                trade['exit_reason'] = "Square Off"
+                trade['status'] = 'CLOSED'
+                trade['pnl'] = (current - trade['entry_price']) * trade['quantity']
             except Exception as e:
-                print(f"Error squareing off {trade.get('symbol')}: {e}")
+                print(f"Error squaring off {trade.get('symbol')}: {e}")
                 continue
         
         st.session_state.active_trades.clear()
@@ -1415,6 +1490,10 @@ def fetch_market_data(kite, index_name):
             'stoch_bearish_cross': stoch_bearish_cross
         }
         
+        # Set last signal time for cooldown
+        if signal != "No Trade":
+            st.session_state.last_signal_time = datetime.now()
+        
         return True
         
     except Exception as e:
@@ -1463,7 +1542,13 @@ def main():
             signal_reason = st.session_state.market_data.get('signal_reason', 'No reason')
             st.markdown(f'<div class="metric-card"><div class="metric-label">Signal Reason</div><div class="metric-value">{signal_reason}</div></div>', unsafe_allow_html=True)
         with m5:
-            st.markdown(f'<div class="metric-card"><div class="metric-label">Today P&L</div><div class="metric-value">{format_pnl(st.session_state.today_loss)}</div></div>', unsafe_allow_html=True)
+            # Show cooldown status if active
+            cooldown_active, cooldown_msg = is_cooldown_active()
+            if cooldown_active:
+                status_msg = f"⏳ {cooldown_msg.split(':')[-1].strip()}"
+            else:
+                status_msg = "✅ Ready"
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Order Status</div><div class="metric-value">{status_msg}</div></div>', unsafe_allow_html=True)
         with m6:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Daily Trades</div><div class="metric-value">{st.session_state.today_trades_count} / {Config.MAX_TRADES_PER_DAY}</div></div>', unsafe_allow_html=True)
         
@@ -1500,6 +1585,12 @@ def main():
                     if active_data:
                         active_df = pd.DataFrame(active_data)
                         st.dataframe(active_df, use_container_width=True)
+                    
+                    # Show square off warning if approaching market close
+                    index_name = st.session_state.selected_index
+                    if should_square_off_before_close(index_name):
+                        trade_start, entry_end, square_off_time = get_trading_hours(index_name)
+                        st.warning(f"⚠️ Market closing soon! All positions will be squared off by {square_off_time.strftime('%H:%M')}")
                 else:
                     st.info("No active trades. Waiting for signal...")
             
@@ -1564,6 +1655,7 @@ def main():
                 Config.SL_POINTS = st.number_input("Stop Loss (Points)", 1, 500, Config.SL_POINTS)
                 Config.TP_POINTS = st.number_input("Target (Points)", 1, 1000, Config.TP_POINTS)
                 Config.MAX_LOSS_PER_DAY = st.number_input("Daily Max Loss (₹)", 500, 50000, Config.MAX_LOSS_PER_DAY)
+                Config.COOLDOWN_AFTER_ORDER = st.number_input("Order Cooldown (seconds)", 10, 300, Config.COOLDOWN_AFTER_ORDER)
                 
             with col_p2:
                 Config.OTM_DISTANCE = st.number_input("OTM Strike Distance", 0, 10, Config.OTM_DISTANCE)
@@ -1577,6 +1669,7 @@ def main():
                         st.warning("⚠️ TSL Step should be less than TSL Trigger for proper trailing.")
                 
                 Config.MAX_TRADES_PER_DAY = st.number_input("Max Trades/Day", 1, 50, Config.MAX_TRADES_PER_DAY)
+                Config.COOLDOWN_AFTER_SIGNAL = st.number_input("Signal Cooldown (seconds)", 5, 120, Config.COOLDOWN_AFTER_SIGNAL)
             
             if st.button("Apply & Save Settings", use_container_width=True):
                 # Validate TSL settings
@@ -1590,6 +1683,11 @@ def main():
 
         # --- BOT LOGIC LOOP ---
         if st.session_state.bot_running:
+            # Reset square off flag at the start of each day
+            now = datetime.now()
+            if now.hour == 0 and now.minute < 5:  # Reset at midnight
+                st.session_state.square_off_triggered = False
+            
             # Fetch market data and generate signals
             if fetch_market_data(kite, st.session_state.selected_index):
                 signal = st.session_state.market_data.get('signal', 'No Trade')
@@ -1619,6 +1717,9 @@ def main():
                         st.toast(f"Order placed: {signal_type} {st.session_state.selected_index}")
                     else:
                         st.toast(f"Failed to place order for {signal_type} signal")
+                elif not can_trade and reason:
+                    # Show why we can't trade
+                    st.toast(f"Not trading: {reason}")
             
             # Monitor active trades for SL/TP/TSL
             trade_manager.monitor_trades()

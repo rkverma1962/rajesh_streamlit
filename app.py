@@ -2,6 +2,7 @@ import streamlit as st
 import time
 import pandas as pd
 import talib
+from talib import STOCH
 import os
 import sys
 import json
@@ -708,12 +709,12 @@ def get_reference_price(kite, index_name):
             return list(ltp_data.values())[0]['last_price']
     except Exception as e:
         print(f"Error getting reference price: {e}")
-        if index_name == "CRUDEOIL":
-            return 6000.0
-        elif index_name == "NIFTY":
-            return 22000.0
-        else:
-            return 48000.0
+        # if index_name == "CRUDEOIL":
+        #     return 6000.0
+        # elif index_name == "NIFTY":
+        #     return 22000.0
+        # else:
+        #     return 48000.0
 
 # --- TRADE MANAGER ---
 class TradeManager:
@@ -1501,7 +1502,23 @@ def fetch_market_data(kite, index_name):
         import traceback
         traceback.print_exc()
         return False
-
+def reset_market_data():
+    """Reset market data when instrument changes"""
+    st.session_state.market_data = {
+        'current_price': 0,
+        'stoch_k': 0,
+        'stoch_d': 0,
+        'stoch_position': "Neutral",
+        'ema5': 0,
+        'ema8': 0,
+        'ema13': 0,
+        'signal': "No Trade",
+        'signal_reason': "Waiting for data",
+        'stoch_bullish_cross': False,
+        'stoch_bearish_cross': False,
+        'ltp': 0
+    }
+    st.session_state.last_signal = None
 # --- MAIN APP ---
 def main():
     init_session_state()
@@ -1641,13 +1658,22 @@ def main():
         with tabs[2]:
             st.markdown("#### ⚙️ Instrument & Risk Settings")
             
+            # Store previous index to detect changes
+            previous_index = st.session_state.selected_index
+            
             # INSTRUMENT SELECTION
             index_options = list(Config.INDEX_MAP.keys())
             st.session_state.selected_index = st.selectbox(
                 "Select Trading Instrument (Crudeoil, Banknifty, Nifty)", 
                 options=index_options, 
-                index=index_options.index(st.session_state.selected_index)
+                index=index_options.index(st.session_state.selected_index),
+                key="instrument_select"
             )
+            
+            # Check if instrument changed and reset market data
+            if st.session_state.selected_index != previous_index:
+                reset_market_data()
+                st.toast(f"Switched to {st.session_state.selected_index}. Market data reset.")
 
             col_p1, col_p2 = st.columns(2)
             with col_p1:

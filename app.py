@@ -8,7 +8,6 @@ import json
 import warnings
 from datetime import datetime, timedelta, time as dtime
 from kiteconnect import KiteConnect, exceptions
-import plotly.graph_objects as go
 import numpy as np
 import base64
 from cryptography.fernet import Fernet
@@ -58,14 +57,14 @@ st.markdown("""
     .metric-label {
         font-size: 1rem;
         color: #94A3B8;
-        font-weight: 600;
+        font-weight: 400;
         text-transform: uppercase;
         letter-spacing: 0.05em;
     }
     
     .metric-value {
         font-size: 1rem;
-        font-weight: 500;
+        font-weight: 400;
         color: #F8FAFC;
         margin-top: 4px;
     }
@@ -97,16 +96,73 @@ st.markdown("""
         box-shadow: 0 0 15px rgba(79, 70, 229, 0.4);
     }
 
+    /* Input Fields and Labels - FIX FOR DARK MODE */
+    div[data-baseweb="input"] label,
+    div[data-baseweb="select"] label,
+    div[data-baseweb="textarea"] label {
+        color: #E2E8F0 !important;
+        font-weight: 500;
+    }
+    
+    /* Form labels and widget labels */
+    .stNumberInput label,
+    .stSelectbox label,
+    .stTextInput label,
+    .stCheckbox label,
+    .stTextArea label {
+        color: #E2E8F0 !important;
+        font-weight: 500;
+    }
+    
+    /* Specific styling for number input labels */
+    div[data-testid="stNumberInput"] label {
+        color: #E2E8F0 !important;
+    }
+    
+    /* Checkbox labels */
+    .stCheckbox span {
+        color: #E2E8F0 !important;
+    }
+    
+    /* Widget containers */
+    div[data-testid="stVerticalBlock"] > div > div > div {
+        color: #E2E8F0 !important;
+    }
+    
+    /* Warning and info text */
+    .stAlert,
+    .stWarning,
+    .stError,
+    .stSuccess,
+    .stInfo {
+        color: #E2E8F0 !important;
+    }
+
     /* Input Fields */
     input, select, textarea {
         background-color: #0F172A !important;
         color: white !important;
         border: 1px solid #334155 !important;
     }
+    
+    /* Number input spinner */
+    input[type="number"] {
+        background-color: #0F172A !important;
+        color: white !important;
+    }
+    
+    /* Placeholder text */
+    ::placeholder {
+        color: #94A3B8 !important;
+    }
 
     /* Custom P&L Colors */
     .pnl-positive { color: #10B981; font-weight: bold; }
     .pnl-negative { color: #EF4444; font-weight: bold; }
+    
+    /* TSL Status Colors */
+    .tsl-active { color: #F59E0B; font-weight: bold; }
+    .tsl-inactive { color: #94A3B8; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -151,6 +207,7 @@ class Config:
     TOTAL_QUANTITY = 30
     SL_POINTS = 25
     TP_POINTS = 100
+    TSL_ENABLED = True  # New: Enable/disable TSL
     TSL_TRIGGER = 25
     TSL_STEP = 10
     MAX_TRADES_PER_DAY = 5
@@ -260,6 +317,7 @@ def save_config():
             'TOTAL_QUANTITY': Config.TOTAL_QUANTITY,
             'SL_POINTS': Config.SL_POINTS,
             'TP_POINTS': Config.TP_POINTS,
+            'TSL_ENABLED': Config.TSL_ENABLED,
             'TSL_TRIGGER': Config.TSL_TRIGGER,
             'TSL_STEP': Config.TSL_STEP,
             'MAX_TRADES_PER_DAY': Config.MAX_TRADES_PER_DAY,
@@ -360,6 +418,14 @@ def format_pnl(value):
 def format_price(value):
     """Ensures price text is bright in dark mode."""
     return f'<span style="color: #F8FAFC;">{value:,.2f}</span>'
+
+def format_tsl_status(is_active):
+    """Formats TSL status with appropriate color."""
+    if is_active:
+        return '<span class="tsl-active">ACTIVE</span>'
+    else:
+        return '<span class="tsl-inactive">INACTIVE</span>'
+
 def get_current_time():
     return datetime.now().strftime("%H:%M:%S")
 
@@ -717,7 +783,6 @@ class TradeManager:
             
             ltp_data = self.kite.ltp(f"{exchange}:{symbol}")
             ltp = ltp_data[f"{exchange}:{symbol}"]["last_price"]
-            
             ltp = round_to_tick(ltp, index_name)
             
             quantity = self.calculate_quantity(index_name)
@@ -743,11 +808,17 @@ class TradeManager:
                     validity=self.kite.VALIDITY_DAY
                 )
                 
+                # Calculate initial SL/TP
                 sl_price = ltp - Config.SL_POINTS
                 tp_price = ltp + Config.TP_POINTS
                 
                 sl_price = round_to_tick(sl_price, index_name)
                 tp_price = round_to_tick(tp_price, index_name)
+                
+                # For TSL tracking
+                highest_price = ltp  # Track highest price reached
+                tsl_triggered = False
+                tsl_price = sl_price  # Initial TSL price = SL price
                 
                 order_record = {
                     'order_id': order_id,
@@ -763,7 +834,12 @@ class TradeManager:
                     'sl_price': sl_price,
                     'tp_price': tp_price,
                     'signal': signal_type,
-                    'reason': 'Order placed successfully'
+                    'reason': 'Order placed successfully',
+                    # TSL tracking fields
+                    'highest_price': highest_price,
+                    'tsl_triggered': tsl_triggered,
+                    'tsl_price': tsl_price,
+                    'tsl_enabled': Config.TSL_ENABLED
                 }
                 
                 self.add_order_record(order_record)
@@ -858,27 +934,62 @@ class TradeManager:
                 exchange = trade.get('exchange', 'NFO')
                 ltp_data = self.kite.ltp(f"{exchange}:{trade['symbol']}")
                 current = ltp_data[f"{exchange}:{trade['symbol']}"]["last_price"]
-                
                 current = round_to_tick(current, trade['index'])
                 
-                if current <= trade['sl_price']:
-                    self.exit_trade(trade, current, "SL")
-                    trade['exit_price'] = current
-                    trade['exit_time'] = datetime.now().isoformat()
-                    trade['exit_reason'] = "SL"
-                    trade['status'] = 'CLOSED'
-                    trade['pnl'] = (current - trade['entry_price']) * trade['quantity']
-                    completed.append(trade)
-                    st.session_state.active_trades.remove(trade)
+                # Update highest price if current is higher
+                if current > trade.get('highest_price', trade['entry_price']):
+                    trade['highest_price'] = current
+                    
+                    # Check if TSL should be triggered (only if TSL is enabled)
+                    if Config.TSL_ENABLED and not trade.get('tsl_triggered', False):
+                        price_move_from_entry = current - trade['entry_price']
+                        if price_move_from_entry >= Config.TSL_TRIGGER:
+                            trade['tsl_triggered'] = True
+                            trade['tsl_price'] = current - Config.TSL_STEP
+                            trade['tsl_price'] = round_to_tick(trade['tsl_price'], trade['index'])
+                    elif Config.TSL_ENABLED and trade.get('tsl_triggered', False):
+                        # Update trailing stop if TSL already triggered
+                        new_tsl_price = current - Config.TSL_STEP
+                        if new_tsl_price > trade.get('tsl_price', trade['sl_price']):
+                            trade['tsl_price'] = round_to_tick(new_tsl_price, trade['index'])
+                
+                # Determine which SL to use (TSL if triggered and enabled, otherwise initial SL)
+                if Config.TSL_ENABLED and trade.get('tsl_triggered', False):
+                    effective_sl_price = trade.get('tsl_price', trade['sl_price'])
+                else:
+                    effective_sl_price = trade['sl_price']
+                
+                # Check exit conditions
+                exit_trade = False
+                exit_reason = ""
+                
+                if current <= effective_sl_price:
+                    exit_trade = True
+                    if Config.TSL_ENABLED and trade.get('tsl_triggered', False):
+                        exit_reason = "TSL"
+                    else:
+                        exit_reason = "SL"
                 elif current >= trade['tp_price']:
-                    self.exit_trade(trade, current, "TP")
+                    exit_trade = True
+                    exit_reason = "TP"
+                
+                if exit_trade:
+                    self.exit_trade(trade, current, exit_reason)
                     trade['exit_price'] = current
                     trade['exit_time'] = datetime.now().isoformat()
-                    trade['exit_reason'] = "TP"
+                    trade['exit_reason'] = exit_reason
                     trade['status'] = 'CLOSED'
                     trade['pnl'] = (current - trade['entry_price']) * trade['quantity']
+                    
+                    # Add TSL info to trade record
+                    if Config.TSL_ENABLED:
+                        trade['tsl_final_price'] = effective_sl_price
+                        trade['tsl_was_triggered'] = trade.get('tsl_triggered', False)
+                        trade['highest_reached'] = trade.get('highest_price', trade['entry_price'])
+                    
                     completed.append(trade)
                     st.session_state.active_trades.remove(trade)
+                    
             except Exception as e:
                 print(f"Error monitoring trade {trade.get('symbol', 'Unknown')}: {e}")
                 continue
@@ -910,7 +1021,7 @@ class TradeManager:
                 validity=self.kite.VALIDITY_DAY
             )
             
-            self.add_order_record({
+            exit_record = {
                 'order_id': exit_order_id,
                 'symbol': trade['symbol'],
                 'index': trade['index'],
@@ -923,7 +1034,17 @@ class TradeManager:
                 'status': 'PENDING',
                 'signal': 'EXIT',
                 'reason': f'{reason} exit'
-            })
+            }
+            
+            # Add TSL info to exit record if applicable
+            if Config.TSL_ENABLED and reason == 'TSL':
+                exit_record['tsl_info'] = {
+                    'triggered': trade.get('tsl_triggered', False),
+                    'final_tsl_price': trade.get('tsl_price'),
+                    'highest_price': trade.get('highest_price')
+                }
+            
+            self.add_order_record(exit_record)
             
         except Exception as e:
             print(f"Error exiting trade: {e}")
@@ -985,14 +1106,11 @@ class TradeManager:
         
         return False
 
-# --- AUTHENTICATION (RIGHT SIDE DASHBOARD) ---
-
+# --- AUTHENTICATION ---
 def render_login_screen():
     """Render the login screen on the right dashboard"""
     if st.session_state.auth_status:
         return None
-    
-    
     
     st.markdown("""
         <div style="text-align: center; margin-bottom: 3rem;">
@@ -1011,7 +1129,7 @@ def render_login_screen():
         st.markdown(f'''
         <div style="background: #E8F5E9; border-radius: 10px; padding: 1rem; margin-bottom: 1rem;">
             <div style="text-align: center; margin-bottom: 0.5rem;">
-                <span style="color: #15803D; font-weight: bold;">✓ Credentials (api_key , api_secret & access_token) Found</span>
+                <span style="color: #15803D; font-weight: bold;">✓ Saved Credentials Found</span>
             </div>
         </div>
         ''', unsafe_allow_html=True)
@@ -1094,7 +1212,6 @@ def render_login_screen():
                 </div>
                 ''', unsafe_allow_html=True)
                 
-                               
                 request_token = st.text_input("Request Token", type="password", placeholder="Paste your request token here")
                 
                 col1, col2 = st.columns(2)
@@ -1144,120 +1261,6 @@ def render_login_screen():
             </p>
         </div>
     """, unsafe_allow_html=True)
-    
-    st.markdown('</div>', unsafe_allow_html=True)
-# --- SIDEBAR CONTROLS ---
-def render_sidebar_controls(kite, trade_manager):
-    """Render bot controls in the left sidebar"""
-    if kite and st.session_state.auth_status:
-        st.sidebar.markdown('<div class="section-header">🤖 BOT CONTROLS</div>', unsafe_allow_html=True)
-        
-        # Bot Status Display
-        status_color = "status-green" if st.session_state.bot_running else "status-red"
-        status_text = "RUNNING" if st.session_state.bot_running else "STOPPED"
-        st.sidebar.markdown(f'''
-        <div class="metric-container">
-            <div class="metric-label">BOT STATUS</div>
-            <span class="status-badge {status_color}">{status_text}</span>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        # Control Buttons
-        col1, col2 = st.sidebar.columns(2)
-        
-        with col1:
-            start_disabled = st.session_state.bot_running
-            if st.button("▶️ START", 
-                        use_container_width=True,
-                        disabled=start_disabled,
-                        type="primary"):
-                st.session_state.bot_running = True
-                st.rerun()
-        
-        with col2:
-            stop_disabled = not st.session_state.bot_running
-            if st.button("⏹️ STOP", 
-                        use_container_width=True,
-                        disabled=stop_disabled,
-                        type="secondary"):
-                st.session_state.bot_running = False
-                st.rerun()
-        
-        # Refresh Orders Button
-        if st.sidebar.button("🔄 REFRESH ORDERS", 
-                           use_container_width=True,
-                           type="secondary"):
-            trade_manager.refresh_order_statuses()
-            st.rerun()
-        
-        # Square Off Button
-        square_disabled = len(st.session_state.active_trades) == 0
-        if st.sidebar.button("🔄 SQUARE OFF ALL", 
-                           use_container_width=True,
-                           disabled=square_disabled,
-                           type="secondary"):
-            trade_manager.square_off_all()
-            st.rerun()
-        
-        # Quick Stats
-        st.sidebar.markdown('<div class="section-header">📊 QUICK STATS</div>', unsafe_allow_html=True)
-        
-        # Today's P&L
-        today_pnl = sum(t.get('pnl', 0) for t in st.session_state.trade_history 
-                       if t.get('status') == 'CLOSED' and 
-                       datetime.fromisoformat(t['entry_time']).date() == datetime.now().date())
-        
-        st.sidebar.markdown(f'''
-        <div class="metric-container">
-            <div class="metric-label">TODAY'S P&L</div>
-            <div class="metric-value">{format_pnl(today_pnl)}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        # Active Trades Count
-        st.sidebar.markdown(f'''
-        <div class="metric-container">
-            <div class="metric-label">ACTIVE TRADES</div>
-            <div class="metric-value">{len(st.session_state.active_trades)}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        # Rejected Orders Count
-        rejected_count = sum(1 for o in st.session_state.order_history if o.get('status') == 'REJECTED')
-        st.sidebar.markdown(f'''
-        <div class="metric-container">
-            <div class="metric-label">REJECTED ORDERS</div>
-            <div class="metric-value">{rejected_count}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        # Trades Left Today
-        remaining = max(0, Config.MAX_TRADES_PER_DAY - st.session_state.today_trades_count)
-        st.sidebar.markdown(f'''
-        <div class="metric-container">
-            <div class="metric-label">TRADES LEFT</div>
-            <div class="metric-value">{remaining}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        # User Info
-        st.sidebar.markdown('<div class="section-header">👤 USER INFO</div>', unsafe_allow_html=True)
-        st.sidebar.markdown(f'''
-        <div class="metric-container">
-            <div class="metric-label">LOGGED IN AS</div>
-            <div class="metric-value" style="font-size: 1rem;">
-                {st.session_state.user_name[:20] if st.session_state.user_name else "N/A"}
-            </div>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        # Logout Button
-        if st.sidebar.button("🚪 LOGOUT", use_container_width=True, type="secondary"):
-            st.session_state.auth_status = False
-            st.session_state.kite = None
-            st.session_state.user_name = None
-            st.session_state.bot_running = False
-            st.rerun()
 
 # --- MARKET DATA ---
 def fetch_market_data(kite, index_name):
@@ -1419,616 +1422,8 @@ def fetch_market_data(kite, index_name):
         import traceback
         traceback.print_exc()
         return False
-# --- DASHBOARD LAYOUT ---
-def dashboard_tab(kite, trade_manager):
-    """Dashboard layout - Shows after authentication"""
-    
-    # Get current index info
-    index_name = st.session_state.selected_index
-    index_info = Config.INDEX_MAP.get(index_name, {})
-    
-    # Calculate current lot size
-    try:
-        current_base_lot = get_base_lot_size(kite, index_name)
-    except:
-        current_base_lot = index_info.get("default_lot_size", 30)
-    
-    current_total_qty = current_base_lot * Config.NUMBER_OF_LOTS
-    
-    # Get trading hours
-    trade_start, entry_end, square_off = get_trading_hours(index_name)
-    
-    # TOP BAR
-    top_cols = st.columns([2, 1])
-    
-    with top_cols[0]:
-        exchange_display = "MCX" if index_name == "CRUDEOIL" else "NFO"
-        tick_size = index_info.get("tick_size", 0.05)
-        st.markdown(f'''
-        <div style="text-align: left;">
-            <h3 style="margin: 0; color: #333;">{index_name} AUTO TRADING BOT</h3>
-            <p style="margin: 0; color: #666; font-size: 0.9rem;">
-                {exchange_display} • Lot: {current_base_lot} × {Config.NUMBER_OF_LOTS} = {current_total_qty} • Tick: {tick_size}
-            </p>
-        </div>
-        ''', unsafe_allow_html=True)
-    
-    with top_cols[1]:
-        user_display = st.session_state.user_name[:20] if st.session_state.user_name else "Not Logged In"
-        st.markdown(f'''
-        <div class="metric-container" style="text-align: right;">
-            <div class="metric-label">USER • TIME</div>
-            <div class="metric-value" style="font-size: 1rem;">
-                {user_display}<br>
-                {get_current_time()}
-            </div>
-        </div>
-        ''', unsafe_allow_html=True)
-    
-    # MARKET DATA SECTION - Compact Card
-    st.markdown('<div class="section-header">📊 MARKET DATA</div>', unsafe_allow_html=True)
-    
-    # Fetch market data
-    fetch_success = fetch_market_data(kite, index_name)
-    
-    if not fetch_success:
-        try:
-            current_price = get_reference_price(kite, index_name)
-            st.session_state.market_data = {
-                'current_price': current_price,
-                'signal': 'Data Fetch Failed'
-            }
-        except:
-            st.session_state.market_data = {
-                'current_price': 6000.0 if index_name == "CRUDEOIL" else 22000.0,
-                'signal': 'Data Unavailable'
-            }
-    
-    market_data = st.session_state.market_data
-    
-    # Create a compact grid for market data in one card
-    st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-    
-    # Row 1: Basic market info
-    row1_cols = st.columns(6)
-    with row1_cols[0]:
-        current_price = market_data.get('current_price', 0)
-        st.metric("Price", f"₹ {format_price(current_price)}")
-    
-    with row1_cols[1]:
-        signal = market_data.get('signal', 'No Signal')
-        signal_icon = "🟢" if signal == "Bullish" else "🔴" if signal == "Bearish" else "⚪"
-        st.metric("Signal", f"{signal_icon} {signal}")
-    
-    with row1_cols[2]:
-        now_time = datetime.now().time()
-        market_open = trade_start <= now_time <= square_off
-        market_status = "🟢 OPEN" if market_open else "🔴 CLOSED"
-        st.metric("Market", market_status)
-    
-    with row1_cols[3]:
-        if 'adx' in market_data:
-            adx = market_data.get('adx', 0)
-            st.metric("ADX", f"{adx:.2f}")
-        else:
-            st.metric("ADX", "N/A")
-    
-    with row1_cols[4]:
-        st.metric("Trades Today", st.session_state.today_trades_count)
-    
-    with row1_cols[5]:
-        st.metric("Trade Hours", f"{trade_start.strftime('%H:%M')}-{entry_end.strftime('%H:%M')}")
-    
-    # Row 2: EMA values
-    row2_cols = st.columns(5)
-    with row2_cols[0]:
-        if 'ema5' in market_data:
-            ema5 = market_data.get('ema5', 0)
-            st.metric("EMA 5", f"₹ {format_price(ema5)}")
-        else:
-            st.metric("EMA 5", "N/A")
-    
-    with row2_cols[1]:
-        if 'ema8' in market_data:
-            ema8 = market_data.get('ema8', 0)
-            st.metric("EMA 8", f"₹ {format_price(ema8)}")
-        else:
-            st.metric("EMA 8", "N/A")
-    
-    with row2_cols[2]:
-        if 'ema13' in market_data:
-            ema13 = market_data.get('ema13', 0)
-            st.metric("EMA 13", f"₹ {format_price(ema13)}")
-        else:
-            st.metric("EMA 13", "N/A")
-    
-    with row2_cols[3]:
-        if all(key in market_data for key in ['ema5', 'ema8', 'ema13']):
-            ema5 = market_data.get('ema5', 0)
-            ema8 = market_data.get('ema8', 0)
-            ema13 = market_data.get('ema13', 0)
-            trend = "BULLISH" if ema5 > ema8 > ema13 else "BEARISH" if ema5 < ema8 < ema13 else "NEUTRAL"
-            st.metric("Trend", trend)
-        else:
-            st.metric("Trend", "N/A")
-    
-    with row2_cols[4]:
-        remaining_trades = max(0, Config.MAX_TRADES_PER_DAY - st.session_state.today_trades_count)
-        st.metric("Trades Left", remaining_trades)
-    
-    st.markdown('</div>', unsafe_allow_html=True)
-    
-    # ACTIVE TRADES
-    st.markdown('<div class="section-header">📦 ACTIVE TRADES</div>', unsafe_allow_html=True)
-    
-    if st.session_state.active_trades:
-        for trade in st.session_state.active_trades:
-            try:
-                exchange = trade.get('exchange', 'NFO')
-                ltp_data = kite.ltp(f"{exchange}:{trade['symbol']}")
-                current = ltp_data[f"{exchange}:{trade['symbol']}"]["last_price"]
-                pnl = (current - trade['entry_price']) * trade['quantity']
-                
-                pnl_color = "#28a745" if pnl >= 0 else "#dc3545"
-                
-                st.markdown(f'''
-                <div class="trade-card">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <strong>{trade["symbol"]}</strong><br>
-                            <small>{trade["option_type"]} • Qty: {trade["quantity"]}</small>
-                        </div>
-                        <div style="text-align: right;">
-                            <div>Entry: ₹ {format_price(trade["entry_price"])}</div>
-                            <div>LTP: ₹ {format_price(current)}</div>
-                            <div>P&L: <span style="color: {pnl_color}">{format_pnl(pnl)}</span></div>
-                        </div>
-                    </div>
-                </div>
-                ''', unsafe_allow_html=True)
-            except:
-                continue
-    else:
-        st.info("No active trades")
-    
-    # TRADING STATISTICS - Compact Card
-    st.markdown('<div class="section-header">📈 TRADING STATISTICS</div>', unsafe_allow_html=True)
-    
-    st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-    
-    stats_cols = st.columns(4)
-    
-    with stats_cols[0]:
-        total_pnl = sum(t.get('pnl', 0) for t in st.session_state.trade_history if t.get('status') == 'CLOSED')
-        today_pnl = sum(t.get('pnl', 0) for t in st.session_state.trade_history 
-                       if t.get('status') == 'CLOSED' and 
-                       datetime.fromisoformat(t['entry_time']).date() == datetime.now().date())
-        
-        st.metric("Total P&L", format_pnl(total_pnl))
-        st.metric("Today's P&L", format_pnl(today_pnl))
-    
-    with stats_cols[1]:
-        st.metric("Today's Loss", f"₹ {format_full_number(st.session_state.today_loss, 2)}")
-        buffer = max(0, Config.MAX_LOSS_PER_DAY - st.session_state.today_loss)
-        st.metric("Loss Buffer", f"₹ {format_full_number(buffer, 2)}")
-    
-    with stats_cols[2]:
-        rejected_today = sum(1 for o in st.session_state.order_history 
-                           if o.get('status') == 'REJECTED' and 
-                           datetime.fromisoformat(o['entry_time']).date() == datetime.now().date())
-        total_orders = sum(1 for o in st.session_state.order_history 
-                          if datetime.fromisoformat(o['entry_time']).date() == datetime.now().date())
-        rejection_rate = (rejected_today / total_orders * 100) if total_orders > 0 else 0
-        
-        st.metric("Today's Rejections", rejected_today)
-        st.metric("Rejection Rate", f"{rejection_rate:.1f}%")
-    
-    with stats_cols[3]:
-        active_trades = len(st.session_state.active_trades)
-        closed_today = sum(1 for t in st.session_state.trade_history 
-                          if t.get('status') == 'CLOSED' and 
-                          datetime.fromisoformat(t['entry_time']).date() == datetime.now().date())
-        
-        st.metric("Active Trades", active_trades)
-        st.metric("Closed Today", closed_today)
-    
-    st.markdown('</div>', unsafe_allow_html=True)
-    
-    # ORDER HISTORY SECTION
-    st.markdown('<div class="section-header">📋 ORDER HISTORY</div>', unsafe_allow_html=True)
-    
-    # Filter controls for orders
-    col1, col2, col3 = st.columns([2, 2, 1])
-    with col1:
-        filter_date = st.selectbox(
-            "Date Filter",
-            ["Today", "Yesterday", "Last 7 Days", "All"],
-            index=0
-        )
-    
-    with col2:
-        status_filter = st.selectbox(
-            "Status Filter",
-            ["All", "REJECTED", "COMPLETE", "OPEN", "PENDING"],
-            index=0
-        )
-    
-    with col3:
-        sort_order = st.selectbox(
-            "Sort",
-            ["Newest First", "Oldest First"],
-            index=0
-        )
-    
-    # Filter orders
-    filtered_orders = st.session_state.order_history.copy()
-    
-    # Apply date filter
-    today = datetime.now().date()
-    if filter_date == "Today":
-        filtered_orders = [o for o in filtered_orders 
-                          if datetime.fromisoformat(o['entry_time']).date() == today]
-    elif filter_date == "Yesterday":
-        yesterday = today - timedelta(days=1)
-        filtered_orders = [o for o in filtered_orders 
-                          if datetime.fromisoformat(o['entry_time']).date() == yesterday]
-    elif filter_date == "Last 7 Days":
-        week_ago = today - timedelta(days=7)
-        filtered_orders = [o for o in filtered_orders 
-                          if datetime.fromisoformat(o['entry_time']).date() >= week_ago]
-    
-    # Apply status filter
-    if status_filter != "All":
-        filtered_orders = [o for o in filtered_orders if o.get('status') == status_filter]
-    
-    # Sort orders
-    if sort_order == "Newest First":
-        filtered_orders.sort(key=lambda x: x.get('entry_time', ''), reverse=True)
-    else:
-        filtered_orders.sort(key=lambda x: x.get('entry_time', ''))
-    
-    if filtered_orders:
-        # Create display data
-        order_data = []
-        for order in filtered_orders:
-            try:
-                entry_time = datetime.fromisoformat(order['entry_time'])
-                time_str = entry_time.strftime("%H:%M:%S")
-                date_str = entry_time.strftime("%Y-%m-%d")
-                
-                status = order.get('status', 'UNKNOWN')
-                reason = order.get('reason', '')
-                rejection_reason = order.get('rejection_reason', '')
-                
-                if status == 'REJECTED' and rejection_reason:
-                    reason = f"{reason} ({rejection_reason})"
-                
-                order_data.append({
-                    "Date": date_str,
-                    "Time": time_str,
-                    "Order ID": order.get('order_id', 'N/A'),
-                    "Symbol": order.get('symbol', 'N/A'),
-                    "Type": order.get('option_type', 'N/A'),
-                    "Qty": order.get('quantity', 'N/A'),
-                    "Price": format_price(order.get('entry_price', 0)) if order.get('entry_price') else 'N/A',
-                    "Status": status,
-                    "Reason": reason,
-                    "Signal": order.get('signal', 'N/A')
-                })
-            except:
-                continue
-        
-        if order_data:
-            # Create DataFrame
-            order_df = pd.DataFrame(order_data)
-            
-            # Style function for status
-            def color_status(val):
-                if val == 'REJECTED':
-                    return 'background-color: #f8d7da; color: #721c24; font-weight: bold;'
-                elif val == 'COMPLETE':
-                    return 'background-color: #d4edda; color: #155724;'
-                elif val == 'OPEN':
-                    return 'background-color: #d1ecf1; color: #0c5460;'
-                elif val == 'PENDING':
-                    return 'background-color: #fff3cd; color: #856404;'
-                else:
-                    return ''
-            
-            # Display as styled table with word wrap for Reason column
-            st.dataframe(
-                order_df.style.applymap(color_status, subset=['Status']),
-                use_container_width=True,
-                hide_index=True,
-                height=400,
-                column_config={
-                    "Date": st.column_config.TextColumn("Date", width="small"),
-                    "Time": st.column_config.TextColumn("Time", width="small"),
-                    "Order ID": st.column_config.TextColumn("Order ID", width="medium"),
-                    "Symbol": st.column_config.TextColumn("Symbol", width="medium"),
-                    "Type": st.column_config.TextColumn("Type", width="small"),
-                    "Qty": st.column_config.NumberColumn("Qty", width="small"),
-                    "Price": st.column_config.TextColumn("Price", width="small"),
-                    "Status": st.column_config.TextColumn("Status", width="small"),
-                    "Reason": st.column_config.TextColumn("Reason", width="large", help="Reason for order status"),
-                    "Signal": st.column_config.TextColumn("Signal", width="small")
-                },
-                column_order=["Date", "Time", "Order ID", "Symbol", "Type", "Qty", "Price", "Status", "Reason", "Signal"]
-            )
-            
-            # Summary stats
-            total_orders = len(filtered_orders)
-            rejected_orders = sum(1 for o in filtered_orders if o.get('status') == 'REJECTED')
-            complete_orders = sum(1 for o in filtered_orders if o.get('status') == 'COMPLETE')
-            rejection_rate = (rejected_orders / total_orders * 100) if total_orders > 0 else 0
-            
-            summary_cols = st.columns(4)
-            with summary_cols[0]:
-                st.metric("Total Orders", total_orders)
-            with summary_cols[1]:
-                st.metric("Rejected Orders", rejected_orders)
-            with summary_cols[2]:
-                st.metric("Complete Orders", complete_orders)
-            with summary_cols[3]:
-                st.metric("Rejection Rate", f"{rejection_rate:.1f}%")
-            
-            # Export button
-            if st.button("📥 Export Order History to CSV"):
-                csv = order_df.to_csv(index=False)
-                st.download_button(
-                    label="Download CSV",
-                    data=csv,
-                    file_name=f"order_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
-                )
-    else:
-        st.info("No order history found with current filters")
-    
-    # REJECTED ORDERS DETAILS
-    with st.expander("⚠️ DETAILED REJECTED ORDERS"):
-        rejected_orders = [o for o in st.session_state.order_history if o.get('status') == 'REJECTED']
-        
-        if rejected_orders:
-            rejected_orders.sort(key=lambda x: x.get('entry_time', ''), reverse=True)
-            
-            for order in rejected_orders[:10]:
-                try:
-                    entry_time = datetime.fromisoformat(order['entry_time'])
-                    time_str = entry_time.strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    st.markdown(f'''
-                    <div class="trade-card">
-                        <div style="margin-bottom: 0.5rem;">
-                            <strong>Rejected Order</strong> • {time_str}
-                        </div>
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; font-size: 0.9rem;">
-                            <div>
-                                <strong>Symbol:</strong> {order.get('symbol', 'N/A')}<br>
-                                <strong>Type:</strong> {order.get('option_type', 'N/A')}<br>
-                                <strong>Qty:</strong> {order.get('quantity', 'N/A')}
-                            </div>
-                            <div>
-                                <strong>Signal:</strong> {order.get('signal', 'N/A')}<br>
-                                <strong>Index:</strong> {order.get('index', 'N/A')}<br>
-                                <strong>Exchange:</strong> {order.get('exchange', 'N/A')}
-                            </div>
-                        </div>
-                        <div style="margin-top: 0.5rem; padding: 0.5rem; background: #f8d7da; border-radius: 4px; white-space: normal; word-wrap: break-word;">
-                            <strong>Rejection Reason:</strong><br>
-                            {order.get('reason', 'No reason provided')}
-                        </div>
-                        {f"<div style='margin-top: 0.5rem; padding: 0.5rem; background: #f5c6cb; border-radius: 4px; white-space: normal; word-wrap: break-word;'><strong>Detailed Reason:</strong><br>{order.get('rejection_reason', '')}</div>" if order.get('rejection_reason') else ""}
-                        {f"<div style='margin-top: 0.5rem; padding: 0.5rem; background: #f5c6cb; border-radius: 4px; white-space: normal; word-wrap: break-word;'><strong>Status Message:</strong><br>{order.get('status_message', '')}</div>" if order.get('status_message') else ""}
-                    </div>
-                    ''', unsafe_allow_html=True)
-                except:
-                    continue
-        else:
-            st.info("No rejected orders found")
-    
-    # TRADE HISTORY
-    st.markdown('<div class="section-header">💰 TRADE HISTORY (Today)</div>', unsafe_allow_html=True)
-    
-    today = datetime.now().date()
-    today_trades = []
-    for trade in st.session_state.trade_history:
-        try:
-            entry_time = datetime.fromisoformat(trade['entry_time'])
-            if entry_time.date() == today and trade.get('status') == 'CLOSED':
-                today_trades.append(trade)
-        except:
-            continue
-    
-    if today_trades:
-        today_trades.sort(key=lambda x: x.get('entry_time', ''), reverse=True)
-        
-        history_data = []
-        for trade in today_trades:
-            try:
-                entry_time = datetime.fromisoformat(trade['entry_time']).strftime("%H:%M:%S")
-                exit_time = datetime.fromisoformat(trade['exit_time']).strftime("%H:%M:%S") if trade.get('exit_time') else "N/A"
-                
-                history_data.append({
-                    "Time": f"{entry_time} → {exit_time}",
-                    "Symbol": trade['symbol'],
-                    "Type": trade['option_type'],
-                    "Qty": trade['quantity'],
-                    "Entry": format_price(trade['entry_price']),
-                    "Exit": format_price(trade.get('exit_price', 0)),
-                    "P&L": format_pnl(trade.get('pnl', 0)),
-                    "Reason": trade.get('exit_reason', 'N/A')
-                })
-            except:
-                continue
-        
-        if history_data:
-            history_df = pd.DataFrame(history_data)
-            
-            def color_pnl(val):
-                if '₹ +' in str(val):
-                    return 'color: #28a745; font-weight: bold;'
-                elif '₹ -' in str(val):
-                    return 'color: #dc3545; font-weight: bold;'
-                else:
-                    return ''
-            
-            st.dataframe(
-                history_df.style.applymap(color_pnl, subset=['P&L']),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Time": st.column_config.TextColumn("Time", width="medium"),
-                    "Symbol": st.column_config.TextColumn("Symbol", width="medium"),
-                    "Type": st.column_config.TextColumn("Type", width="small"),
-                    "Qty": st.column_config.NumberColumn("Qty", width="small"),
-                    "Entry": st.column_config.TextColumn("Entry", width="medium"),
-                    "Exit": st.column_config.TextColumn("Exit", width="medium"),
-                    "P&L": st.column_config.TextColumn("P&L", width="medium"),
-                    "Reason": st.column_config.TextColumn("Reason", width="small")
-                }
-            )
-            
-            closed_pnl = sum(t.get('pnl', 0) for t in today_trades)
-            win_trades = sum(1 for t in today_trades if t.get('pnl', 0) > 0)
-            loss_trades = sum(1 for t in today_trades if t.get('pnl', 0) < 0)
-            win_rate = (win_trades / len(today_trades) * 100) if today_trades else 0
-            
-            summary_cols = st.columns(4)
-            with summary_cols[0]:
-                st.metric("Total Closed Trades", len(today_trades))
-            with summary_cols[1]:
-                st.metric("Win Rate", f"{win_rate:.1f}%")
-            with summary_cols[2]:
-                st.metric("Wins/Losses", f"{win_trades}/{loss_trades}")
-            with summary_cols[3]:
-                st.metric("Today's Closed P&L", format_pnl(closed_pnl))
-    else:
-        st.info("No trade history for today")
-def configuration_tab():
-    """Clean configuration tab"""
-    st.markdown('<div class="section-header">⚙️ BOT CONFIGURATION</div>', unsafe_allow_html=True)
-    
-    index_name = st.session_state.selected_index
-    index_info = Config.INDEX_MAP.get(index_name, {})
-    
-    # Index Selection
-    index_cols = st.columns([2, 1])
-    with index_cols[0]:
-        index_options = list(Config.INDEX_MAP.keys())
-        selected = st.selectbox("TRADING INDEX", index_options, index=index_options.index(index_name))
-        if selected != st.session_state.selected_index:
-            st.session_state.selected_index = selected
-            index_info = Config.INDEX_MAP.get(selected, {})
-    
-    with index_cols[1]:
-        exchange_display = "MCX" if selected == "CRUDEOIL" else "NFO"
-        tick_size = index_info.get("tick_size", 0.05)
-        st.markdown(f'''
-        <div class="metric-container">
-            <div class="metric-label">INDEX INFO</div>
-            <div class="metric-value" style="font-size: 1rem;">
-                Exchange: {exchange_display}<br>
-                Step: {index_info.get('step_size', 100)}<br>
-                Tick: {tick_size}<br>
-                Base Lot: {index_info.get('default_lot_size', 1)}
-            </div>
-        </div>
-        ''', unsafe_allow_html=True)
-    
-    # Configuration in 3 columns
-    config_cols = st.columns(3)
-    
-    with config_cols[0]:
-        st.markdown("**TRADING PARAMETERS**")
-        Config.OTM_DISTANCE = st.slider("OTM Strikes", 1, 5, Config.OTM_DISTANCE)
-        Config.SL_POINTS = st.number_input("Stop Loss (Points)", 5, 100, Config.SL_POINTS)
-        Config.TP_POINTS = st.number_input("Take Profit (Points)", 10, 200, Config.TP_POINTS)
-        Config.MAX_TRADES_PER_DAY = st.number_input("Max Trades/Day", 1, 20, Config.MAX_TRADES_PER_DAY)
-    
-    with config_cols[1]:
-        st.markdown("**POSITION SIZING**")
-        Config.NUMBER_OF_LOTS = st.number_input("Number of Lots", 1, 10, Config.NUMBER_OF_LOTS)
-        
-        base_lot = index_info.get("default_lot_size", 1)
-        auto_quantity = base_lot * Config.NUMBER_OF_LOTS
-        
-        st.markdown(f'''
-        <div class="metric-container">
-            <div class="metric-label">QUANTITY PER TRADE</div>
-            <div class="metric-value">{auto_quantity}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        Config.OVERRIDE_QUANTITY = st.checkbox("Override Quantity", Config.OVERRIDE_QUANTITY)
-        if Config.OVERRIDE_QUANTITY:
-            Config.TOTAL_QUANTITY = st.number_input("Manual Quantity", 1, 1000, Config.TOTAL_QUANTITY)
-    
-    with config_cols[2]:
-        st.markdown("**RISK MANAGEMENT**")
-        Config.MAX_LOSS_PER_DAY = st.number_input("Max Loss/Day (₹)", 500, 10000, Config.MAX_LOSS_PER_DAY)
-        Config.TSL_TRIGGER = st.number_input("TSL Trigger (Points)", 5, 50, Config.TSL_TRIGGER)
-        Config.TSL_STEP = st.number_input("TSL Step (Points)", 5, 50, Config.TSL_STEP)
-        
-        remaining_loss = max(0, Config.MAX_LOSS_PER_DAY - st.session_state.today_loss)
-        st.markdown(f'''
-        <div class="metric-container">
-            <div class="metric-label">REMAINING LOSS LIMIT</div>
-            <div class="metric-value">₹ {format_full_number(remaining_loss, 0)}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-    
-    # Save button
-    if st.button("💾 SAVE CONFIGURATION", use_container_width=True, type="primary"):
-        if save_config():
-            st.success("Configuration saved successfully!")
-
-
-# ... (keep all the previous code until main function)
 
 # --- MAIN APP ---
-def check_auto_login():
-    """Check if we can auto-login with saved credentials and token"""
-    if st.session_state.auth_status:
-        return True
-    
-    # Load saved credentials
-    saved_api_key, saved_api_secret = load_credentials()
-    
-    if saved_api_key and saved_api_secret and os.path.exists(Config.TOKEN_FILE):
-        try:
-            # Try to authenticate with saved credentials
-            kite = KiteConnect(api_key=saved_api_key)
-            
-            with open(Config.TOKEN_FILE, "r") as f:
-                saved_token = f.read().strip()
-            
-            if saved_token:
-                kite.set_access_token(saved_token)
-                
-                # Test authentication by fetching profile
-                profile = kite.profile()
-                
-                # Update session state
-                st.session_state.auth_status = True
-                st.session_state.kite = kite
-                st.session_state.user_name = profile['user_name']
-                st.session_state.api_key = saved_api_key
-                st.session_state.api_secret = saved_api_secret
-                
-                print(f"Auto-login successful for user: {profile['user_name']}")
-                return True
-            else:
-                print("No token found in file")
-                return False
-                
-        except Exception as e:
-            print(f"Auto-login failed: {e}")
-            # Token might be expired, clear it
-            clear_access_token()
-            return False
-    
-    return False
-
 def main():
     init_session_state()
     
@@ -2065,13 +1460,13 @@ def main():
             signal_text = st.session_state.last_signal if st.session_state.last_signal else "WAITING"
             st.markdown(f'<div class="metric-card"><div class="metric-label">Last Signal</div><div class="metric-value">{signal_text}</div></div>', unsafe_allow_html=True)
         with m4:
-            signal_reason = fetch_market_data('signal_reason', 'No reason')
+            signal_reason = st.session_state.market_data.get('signal_reason', 'No reason')
             st.markdown(f'<div class="metric-card"><div class="metric-label">Signal Reason</div><div class="metric-value">{signal_reason}</div></div>', unsafe_allow_html=True)
         with m5:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Today P&L</div><div class="metric-value">{format_pnl(st.session_state.today_loss)}</div></div>', unsafe_allow_html=True)
         with m6:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Daily Trades</div><div class="metric-value">{st.session_state.today_trades_count} / {Config.MAX_TRADES_PER_DAY}</div></div>', unsafe_allow_html=True)
-
+        
         # --- MAIN DASHBOARD TABS ---
         tabs = st.tabs(["📊 Live Market", "📜 Order Log", "🛠 Setup"])
         
@@ -2080,9 +1475,31 @@ def main():
             with col_l:
                 st.markdown("#### Active Positions")
                 if st.session_state.active_trades:
-                    # Filter and show active trades
-                    active_df = pd.DataFrame(st.session_state.active_trades)
-                    st.dataframe(active_df[['symbol', 'entry_price', 'quantity', 'status', 'sl_price', 'tp_price']], use_container_width=True)
+                    # Create a formatted dataframe for active trades
+                    active_data = []
+                    for trade in st.session_state.active_trades:
+                        row = {
+                            'Symbol': trade['symbol'],
+                            'Entry': f"₹{trade['entry_price']:.2f}",
+                            'Qty': trade['quantity'],
+                            'Current SL': f"₹{trade['sl_price']:.2f}",
+                            'TP': f"₹{trade['tp_price']:.2f}",
+                            'Status': trade['status']
+                        }
+                        
+                        # Add TSL info if enabled
+                        if Config.TSL_ENABLED:
+                            tsl_status = "ACTIVE" if trade.get('tsl_triggered', False) else "INACTIVE"
+                            row['TSL Status'] = tsl_status
+                            if trade.get('tsl_triggered', False):
+                                row['TSL Price'] = f"₹{trade.get('tsl_price', 0):.2f}"
+                            row['Highest'] = f"₹{trade.get('highest_price', trade['entry_price']):.2f}"
+                        
+                        active_data.append(row)
+                    
+                    if active_data:
+                        active_df = pd.DataFrame(active_data)
+                        st.dataframe(active_df, use_container_width=True)
                 else:
                     st.info("No active trades. Waiting for signal...")
             
@@ -2105,12 +1522,28 @@ def main():
 
         with tabs[1]:
             st.markdown("#### Activity & Order History")
-            # LOG FIX: Retrieve from session state order history
             if st.session_state.order_history:
-                log_df = pd.DataFrame(st.session_state.order_history)
-                # Sort by most recent first
-                log_df = log_df.sort_index(ascending=False)
-                st.dataframe(log_df[['entry_time', 'symbol', 'signal', 'quantity', 'status', 'reason']], use_container_width=True)
+                # Create a formatted dataframe for order history
+                log_data = []
+                for order in reversed(st.session_state.order_history[-50:]):  # Show last 50 orders
+                    row = {
+                        'Time': order.get('entry_time', ''),
+                        'Symbol': order.get('symbol', ''),
+                        'Signal': order.get('signal', ''),
+                        'Qty': order.get('quantity', ''),
+                        'Status': order.get('status', ''),
+                        'Reason': order.get('reason', '')[:50]  # Limit length
+                    }
+                    
+                    # Add exit reason if available
+                    if order.get('signal') == 'EXIT':
+                        row['Exit Reason'] = order.get('reason', '').split(' ')[0] if order.get('reason') else ''
+                    
+                    log_data.append(row)
+                
+                if log_data:
+                    log_df = pd.DataFrame(log_data)
+                    st.dataframe(log_df, use_container_width=True)
             else:
                 st.info("Log is currently empty. Orders will appear here once the bot starts trading.")
 
@@ -2120,7 +1553,7 @@ def main():
             # INSTRUMENT SELECTION
             index_options = list(Config.INDEX_MAP.keys())
             st.session_state.selected_index = st.selectbox(
-                "Select Trading Instrument (Nifty, Banknifty, Crudeoil)", 
+                "Select Trading Instrument (Crudeoil, Banknifty, Nifty)", 
                 options=index_options, 
                 index=index_options.index(st.session_state.selected_index)
             )
@@ -2129,19 +1562,65 @@ def main():
             with col_p1:
                 Config.NUMBER_OF_LOTS = st.number_input("Lots", 1, 100, Config.NUMBER_OF_LOTS)
                 Config.SL_POINTS = st.number_input("Stop Loss (Points)", 1, 500, Config.SL_POINTS)
+                Config.TP_POINTS = st.number_input("Target (Points)", 1, 1000, Config.TP_POINTS)
                 Config.MAX_LOSS_PER_DAY = st.number_input("Daily Max Loss (₹)", 500, 50000, Config.MAX_LOSS_PER_DAY)
+                
             with col_p2:
                 Config.OTM_DISTANCE = st.number_input("OTM Strike Distance", 0, 10, Config.OTM_DISTANCE)
-                Config.TP_POINTS = st.number_input("Target (Points)", 1, 1000, Config.TP_POINTS)
+                Config.TSL_ENABLED = st.checkbox("Enable Trailing Stop Loss (TSL)", value=Config.TSL_ENABLED)
+                if Config.TSL_ENABLED:
+                    Config.TSL_TRIGGER = st.number_input("TSL Trigger (Points)", 1, 200, Config.TSL_TRIGGER)
+                    Config.TSL_STEP = st.number_input("TSL Step (Points)", 1, 100, Config.TSL_STEP)
+                    
+                    # Validation: TSL Step must be less than TSL Trigger
+                    if Config.TSL_STEP >= Config.TSL_TRIGGER:
+                        st.warning("⚠️ TSL Step should be less than TSL Trigger for proper trailing.")
+                
                 Config.MAX_TRADES_PER_DAY = st.number_input("Max Trades/Day", 1, 50, Config.MAX_TRADES_PER_DAY)
             
             if st.button("Apply & Save Settings", use_container_width=True):
-                save_config()
-                st.success("Configuration updated and saved to bot_config.json")
+                # Validate TSL settings
+                if Config.TSL_ENABLED and Config.TSL_STEP >= Config.TSL_TRIGGER:
+                    st.error("TSL Step must be less than TSL Trigger. Please adjust values.")
+                else:
+                    if save_config():
+                        st.success("Configuration updated and saved to bot_config.json")
+                    else:
+                        st.error("Failed to save configuration")
 
         # --- BOT LOGIC LOOP ---
         if st.session_state.bot_running:
-            # Monitor active trades for SL/TP
+            # Fetch market data and generate signals
+            if fetch_market_data(kite, st.session_state.selected_index):
+                signal = st.session_state.market_data.get('signal', 'No Trade')
+                signal_reason = st.session_state.market_data.get('signal_reason', '')
+                
+                # Update last signal
+                st.session_state.last_signal = f"{signal} - {signal_reason}"
+                
+                # Check if we should place a trade
+                can_trade, reason = trade_manager.can_trade()
+                
+                if can_trade and ("Bullish" in signal or "Bearish" in signal):
+                    # Determine signal type
+                    signal_type = "BUY" if "Bullish" in signal else "SELL"
+                    
+                    # Get reference price
+                    ref_price = get_reference_price(kite, st.session_state.selected_index)
+                    
+                    # Place order
+                    order_id = trade_manager.place_order(
+                        st.session_state.selected_index, 
+                        signal_type, 
+                        ref_price
+                    )
+                    
+                    if order_id:
+                        st.toast(f"Order placed: {signal_type} {st.session_state.selected_index}")
+                    else:
+                        st.toast(f"Failed to place order for {signal_type} signal")
+            
+            # Monitor active trades for SL/TP/TSL
             trade_manager.monitor_trades()
             trade_manager.update_stats()
             

@@ -2099,7 +2099,6 @@ def main():
                         st.rerun()
                 
                 # SQUARE OFF BUTTON
-                st.divider()
                 if st.button("🚨 SQUARE OFF ALL", type="primary", use_container_width=True):
                     trade_manager.square_off_all()
                     st.warning("All active positions have been squared off.")

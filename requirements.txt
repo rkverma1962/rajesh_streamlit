@@ -1,0 +1,7 @@
+streamlit
+pandas
+numpy
+kiteconnect
+plotly
+python-dateutil
+ta-lib
